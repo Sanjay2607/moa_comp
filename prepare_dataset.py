@@ -11,6 +11,8 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import QuantileTransformer
 from sklearn.cluster import  KMeans
 from sklearn.feature_selection import VarianceThreshold
+from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
+
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -133,3 +135,90 @@ def fe_cluster(train, test, n_clusters_g = 35, n_clusters_c = 5, SEED = 123):
     train, test = fe_cluster(train, test)
     train, test = fe_stats  (train, test)
     return train, test
+
+
+    def process_score(scored, targets, seed=42, folds=7):
+    # LOCATE DRUGS
+    vc = scored.drug_id.value_counts()
+    vc1 = vc.loc[vc<=18].index.sort_values()
+    vc2 = vc.loc[vc>18].index.sort_values()
+
+    # STRATIFY DRUGS 18X OR LESS
+    dct1 = {}; dct2 = {}
+    skf = MultilabelStratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
+    tmp = scored.groupby('drug_id')[targets].mean().loc[vc1]
+    for fold,(idxT,idxV) in enumerate( skf.split(tmp,tmp[targets])):
+        dd = {k:fold for k in tmp.index[idxV].values}
+        dct1.update(dd)
+    
+    # STRATIFY DRUGS MORE THAN 18X
+    skf = MultilabelStratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
+    tmp = scored.loc[scored.drug_id.isin(vc2)].reset_index(drop=True)
+    for fold,(idxT,idxV) in enumerate( skf.split(tmp,tmp[targets])):
+        dd = {k:fold for k in tmp.sig_id[idxV].values}
+        dct2.update(dd)
+    
+    # ASSIGN FOLDS
+    scored['kfold'] = scored.drug_id.map(dct1)
+    scored.loc[scored.kfold.isna(),'kfold'] =\
+        scored.loc[scored.kfold.isna(),'sig_id'].map(dct2)
+    scored.kfold = scored.kfold.astype('int8')
+    return scored
+
+    def prepare(train, test, scored, targets):
+    train, test = process(train, test)
+    train_scored = process_score(scored, targets)
+    
+    # merge features with scores
+    folds = train.merge(scored, on='sig_id')
+    folds = folds[folds['cp_type']!='ctl_vehicle'].reset_index(drop=True)
+    test  = test [test ['cp_type']!='ctl_vehicle'].reset_index(drop=True)
+
+    folds = folds.drop('cp_type', axis=1)
+    test  = test.drop ('cp_type', axis=1)
+
+    # converting column names to str
+    folds.columns = [str(c) for c in folds.columns.values.tolist()]
+
+    # One-hot encoding 
+    folds = pd.get_dummies(folds, columns=['cp_time', 'cp_dose'])
+    test  = pd.get_dummies(test , columns=['cp_time', 'cp_dose'])
+
+    ## Targets
+    target_cols = scored.drop(['sig_id', 'kfold', 'drug_id'], axis=1).columns.values.tolist()
+
+    # features columns
+    to_drop = target_cols + ['sig_id', 'kfold', 'drug_id']
+    feature_cols = [c for c in folds.columns if c not in to_drop]
+    
+    return folds, test, feature_cols, target_cols
+
+
+    if __name__ == "__main__":
+    import sys
+    import joblib
+    
+    path = sys.argv[1]
+
+    train_features = pd.read_csv(f'{path}/train_features.csv')
+    test_features  = pd.read_csv(f'{path}/test_features.csv')
+    train_targets_scored = pd.read_csv(f'{path}/train_targets_scored.csv')
+    drug = pd.read_csv(f'{path}/train_drug.csv')
+    
+    targets = train_targets_scored.columns[1:]
+    train_targets_scored = train_targets_scored.merge(drug, on='sig_id', how='left') 
+
+    folds, test, feature_cols, target_cols = prepare(train_features, 
+                                                     test_features, 
+                                                     train_targets_scored, 
+                                                     targets)
+    
+    print(folds.shape)
+    print(test.shape)
+    print(f'Targets : {len(target_cols)}')
+    print(f'Features : {len(feature_cols)}')
+    
+    folds.to_csv(path/'folds.csv', index=False)
+    test .to_csv(path/'test.csv' , index=False)
+    columns = {'features': feature_cols, 'targets': target_cols}
+    joblib.dump(columns, path/'columns.pkl')
